@@ -220,7 +220,123 @@ def _vision_info(messages):
     return image_inputs, video_inputs, video_kwargs
 
 
-def logits_reward(model, processor, frames: list, caption: str, fps: float, reduction: str = "mean") -> dict:
+def _is_molmo(model_name: str) -> bool:
+    """Molmo2 needs a different vision pipeline (molmo_utils + timestamps)."""
+    return "molmo" in model_name.lower()
+
+
+def _strip_trailing_eos(processor, prompt_chat: str) -> str:
+    """Strip only the FINAL turn-closing eos so the scored text continues the
+    user turn. Using rsplit (last eos) — not split (first eos) — is crucial for
+    templates that prepend a system message (e.g. Qwen2.5-VL); splitting on the
+    first eos would discard the user turn and all vision tokens."""
+    eos = getattr(processor.tokenizer, "eos_token", None)
+    if eos and eos in prompt_chat:
+        return prompt_chat.rsplit(eos, 1)[0]
+    return prompt_chat
+
+
+def _qwen_inputs(model, processor, pil_frames: list, fps: float, prompt_text: str, scored_text: str):
+    """Build (forward inputs, prompt_len) for a Qwen-VL-style processor.
+
+    Renders the chat prefix (video + prompt_text) WITHOUT a generation prompt,
+    strips a trailing eos, then appends the span we want to score. Mirrors
+    topreward/clients/qwen.py.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": pil_frames, "fps": fps},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+    prompt_chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    prompt_chat = _strip_trailing_eos(processor, prompt_chat)
+    full_text = f"{prompt_chat}{scored_text}"
+
+    image_inputs, video_inputs, video_kwargs = _vision_info(messages)
+    inputs = processor(
+        text=[full_text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+        **video_kwargs,
+    ).to(model.device)
+    prompt_inputs = processor(
+        text=[prompt_chat],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+        **video_kwargs,
+    )
+    prompt_len = int(prompt_inputs["input_ids"].shape[1])
+    return inputs, prompt_len
+
+
+def _molmo_inputs(model, processor, pil_frames: list, prompt_text: str, scored_text: str):
+    """Build (forward inputs, prompt_len) for a Molmo2 processor.
+
+    Molmo2 uses molmo_utils.process_vision_info (timestamp-based video metadata)
+    rather than qwen_vl_utils, and the processor takes videos= + video_metadata=
+    with the text as a plain string. Mirrors topreward/clients/molmo.py. The
+    answer span scored is the same as the Qwen path, so VOC/reward stay comparable.
+    """
+    try:
+        from molmo_utils import process_vision_info as molmo_vision_info
+    except ImportError as exc:
+        raise ImportError(
+            "molmo_utils is required to run Molmo2 models. Install it with "
+            "`uv add molmo_utils` (or `pip install molmo-utils`)."
+        ) from exc
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": pil_frames, "timestamps": np.arange(len(pil_frames))},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+    _, videos, video_kwargs = molmo_vision_info(messages)
+    if videos is None:
+        raise ValueError("molmo_utils.process_vision_info returned no videos")
+    videos, video_metadatas = zip(*videos, strict=False)
+    videos, video_metadatas = list(videos), list(video_metadatas)
+    # Single-frame prefixes confuse the timestamp metadata; patch as molmo.py does.
+    for idx, md in enumerate(video_metadatas):
+        if md["total_num_frames"] == 1:
+            video_metadatas[idx]["fps"] = 1.0
+            video_metadatas[idx]["frames_indices"] = np.array([1])
+
+    prompt_chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    prompt_chat = _strip_trailing_eos(processor, prompt_chat)
+    full_text = f"{prompt_chat}{scored_text}"
+
+    def _proc(text: str):
+        out = processor(
+            videos=videos,
+            video_metadata=video_metadatas,
+            text=text,
+            padding=True,
+            return_tensors="pt",
+            **video_kwargs,
+        )
+        return {k: v.to(model.device) for k, v in out.items()}
+
+    inputs = _proc(full_text)
+    prompt_inputs = _proc(prompt_chat)
+    prompt_len = int(prompt_inputs["input_ids"].shape[1])
+    return inputs, prompt_len
+
+
+def logits_reward(model, processor, frames: list, caption: str, fps: float, reduction: str = "mean", is_molmo: bool = False) -> dict:
     """Score a (video, caption) pair by the log-prob of the answer span.
 
     Builds  [video] + PROMPT_PREFIX + caption + ANSWER_LEADIN + " True", runs a
@@ -236,50 +352,15 @@ def logits_reward(model, processor, frames: list, caption: str, fps: float, redu
     # Everything after the video that we want to *score* under the model logits.
     scored_text = f"{caption}{ANSWER_LEADIN}{ANSWER_WORD}"
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "video", "video": pil_frames, "fps": fps},
-                {"type": "text", "text": prompt_text},
-            ],
-        }
-    ]
-
-    # Render the chat prefix (video + prompt_text) WITHOUT a generation prompt,
-    # strip a trailing eos if the template added one, then append the span we
-    # want to score. Mirrors topreward/clients/qwen.py.
-    prompt_chat = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    eos = getattr(processor.tokenizer, "eos_token", None)
-    if eos and eos in prompt_chat:
-        # Strip only the FINAL turn-closing eos so the scored text continues the
-        # user turn. Using rsplit (last eos) — not split (first eos) — is crucial
-        # for templates that prepend a system message (e.g. Qwen2.5-VL); splitting
-        # on the first eos would discard the user turn and all vision tokens.
-        prompt_chat = prompt_chat.rsplit(eos, 1)[0]
-    full_text = f"{prompt_chat}{scored_text}"
-
-    image_inputs, video_inputs, video_kwargs = _vision_info(messages)
-    inputs = processor(
-        text=[full_text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-        **video_kwargs,
-    ).to(model.device)
-
-    # Tokenize the prompt-only prefix the same way to find how many leading
-    # tokens to mask out (we only score the answer span, not the video/prompt).
-    prompt_inputs = processor(
-        text=[prompt_chat],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-        **video_kwargs,
-    )
-    prompt_len = int(prompt_inputs["input_ids"].shape[1])
+    # Build the forward-pass inputs and the prompt-prefix length (how many leading
+    # tokens to mask out — we only score the answer span, not the video/prompt).
+    # The reward definition is identical across model families; only the vision /
+    # processor plumbing differs (Qwen-VL vs Molmo2), so they share the masking and
+    # log-prob math below.
+    if is_molmo:
+        inputs, prompt_len = _molmo_inputs(model, processor, pil_frames, prompt_text, scored_text)
+    else:
+        inputs, prompt_len = _qwen_inputs(model, processor, pil_frames, fps, prompt_text, scored_text)
 
     labels = inputs["input_ids"].clone()
     labels[:, :prompt_len] = -100
@@ -318,7 +399,7 @@ def logits_reward(model, processor, frames: list, caption: str, fps: float, redu
     }
 
 
-def progress_curve(model, processor, frames: list, caption: str, fps: float, num_prefixes: int = 8) -> dict:
+def progress_curve(model, processor, frames: list, caption: str, fps: float, num_prefixes: int = 8, is_molmo: bool = False) -> dict:
     """Compute the reward on trajectory prefixes and normalise -> progress.
 
     Mirrors topreward/clients/qwen.py::compute_instruction_rewards_for_prefixes:
@@ -331,7 +412,7 @@ def progress_curve(model, processor, frames: list, caption: str, fps: float, num
     lengths = sorted({int(x) for x in np.linspace(2, n, min(num_prefixes, n - 1))})
     rewards = []
     for k in lengths:
-        r = logits_reward(model, processor, frames[:k], caption, fps, reduction="mean")
+        r = logits_reward(model, processor, frames[:k], caption, fps, reduction="mean", is_molmo=is_molmo)
         rewards.append(r["reward_mean"])
 
     arr = np.asarray(rewards, dtype=float)
@@ -423,12 +504,25 @@ def load_model(model_name: str):
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     print(f"[model] loading {model_name} ...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
-        attn_implementation="sdpa",
-    )
+    common = {"torch_dtype": torch.bfloat16, "device_map": "cuda"}
+    if _is_molmo(model_name):
+        # Molmo2 ships custom modeling code (trust_remote_code) and prefers
+        # flash-attention-2; degrade through sdpa to eager so the run still works
+        # wherever flash-attn isn't built or the custom model rejects a kernel.
+        model = None
+        for attn in ("flash_attention_2", "sdpa", "eager"):
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_name, trust_remote_code=True, attn_implementation=attn, **common
+                )
+                print(f"[model] loaded with attn_implementation={attn}")
+                break
+            except Exception as exc:  # noqa: BLE001 - try the next available kernel
+                print(f"[model] attn_implementation={attn} unavailable ({exc!r})")
+        if model is None:
+            raise RuntimeError(f"could not load {model_name} with any attention implementation")
+    else:
+        model = AutoModelForImageTextToText.from_pretrained(model_name, attn_implementation="sdpa", **common)
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
     print(f"[model] loaded on {model.device}")
@@ -446,6 +540,7 @@ def run(num_samples: int, model_name: str, out_path: str, cache_dir: str, max_fr
     print(f"[run] loaded {len(samples)} Ego4D samples")
 
     model, processor = load_model(model_name)
+    is_molmo = _is_molmo(model_name)
 
     results: list[SampleResult] = []
     with out.open("w", encoding="utf-8") as fh:
@@ -453,8 +548,8 @@ def run(num_samples: int, model_name: str, out_path: str, cache_dir: str, max_fr
             frames = _uniform_subsample(s.frames, max_frames)
             print(f"[run] {i + 1}/{len(samples)} ep={s.episode_index} frames={len(frames)} :: {s.caption[:70]!r}")
             try:
-                rw = logits_reward(model, processor, frames, s.caption, s.fps, reduction="mean")
-                pg = progress_curve(model, processor, frames, s.caption, s.fps, num_prefixes=num_prefixes)
+                rw = logits_reward(model, processor, frames, s.caption, s.fps, reduction="mean", is_molmo=is_molmo)
+                pg = progress_curve(model, processor, frames, s.caption, s.fps, num_prefixes=num_prefixes, is_molmo=is_molmo)
                 res = SampleResult(
                     episode_index=s.episode_index,
                     task_index=s.task_index,

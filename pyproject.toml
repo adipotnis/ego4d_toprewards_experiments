@@ -10,6 +10,7 @@ dependencies = [
     "huggingface-hub>=0.24.0",
     "loguru>=0.7.3",
     "matplotlib>=3.8.0",
+    "molmo-utils>=0.0.1",
     "numpy>=1.26.0",
     "pillow>=10.0.0",
     "pyarrow>=15.0.0",

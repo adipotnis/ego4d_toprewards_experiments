@@ -14,7 +14,7 @@ For every Ego4D clip (egocentric video + narration caption) the script computes:
 
 ## Files
 
-- `topreward_test.py` — the experiment script. Self-contained loader for `mderry/ego4d-manipulation-v1` (LeRobot v3.0 format, no `lerobot` dep), Qwen-VL-style logits reward, progress curve, per-sample plots.
+- `topreward_test.py` — the experiment script. Self-contained loader for `mderry/ego4d-manipulation-v1` (LeRobot v3.0 format, no `lerobot` dep), logits reward, progress curve, per-sample plots. Supports both **Qwen3-VL** (via `qwen-vl-utils`) and **Molmo2** (via `molmo-utils`, timestamp-based video metadata) — the model family is auto-detected from the `--model` id (anything containing `molmo` takes the Molmo2 path). Both families score the same answer span, so VOC / reward stay directly comparable.
 - `compare_models.py` — side-by-side comparison across multiple VLMs.
 - `run_topreward_test.sbatch` — Slurm submission script (gitignored — cluster-specific).
 
@@ -83,6 +83,21 @@ NUM_SAMPLES=200 MODEL=Qwen/Qwen3-VL-4B-Instruct sbatch run_topreward_test.sbatch
 ```
 
 Environment variables read by the sbatch: `MODEL`, `NUM_SAMPLES`, `MAX_FRAMES`, `NUM_PREFIXES`.
+
+### Molmo2
+
+Pass a Molmo2 model id and the script auto-selects the Molmo2 vision path (no code/flag change):
+
+```bash
+uv run python topreward_test.py --num-samples 40 \
+    --model allenai/Molmo2-8B \
+    --out runs/allenai_Molmo2-8B/topreward.jsonl \
+    --plots-dir runs/allenai_Molmo2-8B/plots
+# or on Slurm:
+NUM_SAMPLES=200 MODEL=allenai/Molmo2-8B sbatch run_topreward_test.sbatch
+```
+
+Molmo2 needs the `molmo-utils` package (a declared dependency, installed by `uv sync`) and ships custom modeling code, so it loads with `trust_remote_code=True`. It prefers flash-attention-2 and falls back to `sdpa` when flash-attn isn't built. If you reuse the upstream `.venv_tr/` rather than `uv sync`, make sure `molmo_utils` is installed there too (`allenai/Molmo2-4B` is the smaller, faster checkpoint).
 
 ## Outputs
 

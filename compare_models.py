@@ -80,7 +80,7 @@ def main() -> None:
     order = sorted(summary, key=lambda t: summary[t]["voc"]["mean"], reverse=True)
     means = [summary[t]["voc"]["mean"] for t in order]
     stds = [summary[t]["voc"]["std"] for t in order]
-    labels = [t.replace("Qwen_", "") for t in order]
+    labels = [t.replace("Qwen_", "").replace("allenai_", "") for t in order]
 
     fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(order)), 5), constrained_layout=True)
     bars = ax.bar(labels, means, yerr=stds, capsize=5, color="#4c72b0", alpha=0.9)
@@ -110,7 +110,7 @@ def main() -> None:
                 continue
             cap = row["caption"]
             ax.plot(row["prefix_frame_counts"], row["progress"], "-o", ms=3, lw=1.5,
-                    color=model_color[tag], label=tag.replace("Qwen_", ""))
+                    color=model_color[tag], label=tag.replace("Qwen_", "").replace("allenai_", ""))
         ax.set_title(f"ep {ep}: {cap[:48]}", fontsize=8, loc="left")
         ax.set_xlabel("prefix length (# frames)")
         ax.set_ylabel("progress")
