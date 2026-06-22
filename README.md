@@ -50,14 +50,8 @@ To run anything: prefix with `uv run` (it auto-activates `.venv/`):
 
 ```bash
 uv run python topreward_test.py --help
-uv run ruff check .
-uv run ruff format .
-uv run pytest
 uv run pyright topreward_test.py compare_models.py
 ```
-
-Dev tools (`ruff`, `pyright`, `pytest`, `black`, `isort`) live in the `dev` dependency group and are installed by `uv sync` automatically.
-
 ## Run
 
 Stand-alone (uses the experiments dir's own venv from `uv sync`):
