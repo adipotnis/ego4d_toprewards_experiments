@@ -1,4 +1,6 @@
-runs/
+runs/**
+!runs/**/
+!runs/**/*.png
 __pycache__/
 *.pyc
 .venv*/
