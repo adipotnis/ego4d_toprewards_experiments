@@ -1,0 +1,81 @@
+[project]
+name = "ego4d-toprewards-experiments"
+version = "0.1.0"
+description = "Standalone Ego4D TOPReward experiments (logits-based zero-shot reward + progress curve)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.8.1",
+    "av>=12.0.0",
+    "huggingface-hub>=0.24.0",
+    "loguru>=0.7.3",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "pyarrow>=15.0.0",
+    "qwen-vl-utils>=0.0.14",
+    "scipy>=1.16.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==4.57.1",
+]
+
+[tool.uv]
+override-dependencies = ["torch==2.8.0", "torchvision==0.23.0"]
+
+[dependency-groups]
+dev = [
+    "black>=24.10.0",
+    "isort>=6.0.1",
+    "pyright>=1.1.405",
+    "pytest>=8.4.1",
+    "ruff>=0.12.2",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 160
+fix = true
+
+[tool.ruff.lint]
+select = [
+    "YTT",
+    "S",
+    "B",
+    "A",
+    "C4",
+    "T10",
+    "SIM",
+    "I",
+    "C90",
+    "E", "W",
+    "F",
+    "PGH",
+    "UP",
+    "RUF",
+    "TRY",
+]
+ignore = [
+    "TRY003",
+    "TRY300",
+    "TRY301",
+    "TRY002",
+    "C901",
+    "S112",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"compare_models.py" = ["S101"]
+
+[tool.ruff.lint.isort]
+required-imports = []
+
+[tool.isort]
+profile = "black"
+line_length = 160
+
+[tool.black]
+line-length = 160
+
+[tool.setuptools.packages.find]
+include = []

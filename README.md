@@ -2,7 +2,7 @@
 
 Standalone re-implementation of [TOPReward](https://topreward.github.io/webpage/) ("Token Probabilities as Hidden Zero-Shot Rewards") run on Ego4D first-person manipulation clips.
 
-Self-contained: does not import from the upstream `topreward` Python package. Reuses its venv only.
+Self-contained: does not import from the upstream `topreward` Python package. Has its own `pyproject.toml` / `uv.lock`, so the experiments dir can stand on its own with `uv sync`. (The cluster sbatch happens to reuse the upstream's `.venv_tr/` because it's already provisioned — see [External paths](#external-paths) — but that's an optimization, not a requirement.)
 
 ## What it does
 
@@ -38,16 +38,46 @@ Layout this expects:
 
 Both paths are referenced as absolute paths from the sbatch; the local recipe below sets them inline.
 
+## Install
+
+Managed with [uv](https://github.com/astral-sh/uv). One command to create `.venv/` and install everything from `uv.lock`:
+
+```bash
+uv sync
+```
+
+To run anything: prefix with `uv run` (it auto-activates `.venv/`):
+
+```bash
+uv run python topreward_test.py --help
+uv run ruff check .
+uv run ruff format .
+uv run pytest
+uv run pyright topreward_test.py compare_models.py
+```
+
+Dev tools (`ruff`, `pyright`, `pytest`, `black`, `isort`) live in the `dev` dependency group and are installed by `uv sync` automatically.
+
 ## Run
 
-Local / interactive (replace `<TOPREWARD_ROOT>` with your checkout root):
+Stand-alone (uses the experiments dir's own venv from `uv sync`):
+
+```bash
+cd <TOPREWARD_ROOT>/ego4d_toprewards_experiments
+export HF_HOME=<TOPREWARD_ROOT>/hf_cache    # optional, see [External paths](#external-paths)
+uv run python topreward_test.py --num-samples 40 \
+    --model Qwen/Qwen3-VL-4B-Instruct \
+    --out runs/Qwen_Qwen3-VL-4B-Instruct/topreward.jsonl \
+    --plots-dir runs/Qwen_Qwen3-VL-4B-Instruct/plots
+```
+
+Reusing the upstream's existing venv (skip `uv sync`):
 
 ```bash
 cd <TOPREWARD_ROOT>/ego4d_toprewards_experiments
 source <TOPREWARD_ROOT>/repo/.venv_tr/bin/activate
 export HF_HOME=<TOPREWARD_ROOT>/hf_cache
-python topreward_test.py --num-samples 40 \
-    --model Qwen/Qwen3-VL-4B-Instruct \
+python topreward_test.py --num-samples 40 --model Qwen/Qwen3-VL-4B-Instruct \
     --out runs/Qwen_Qwen3-VL-4B-Instruct/topreward.jsonl \
     --plots-dir runs/Qwen_Qwen3-VL-4B-Instruct/plots
 ```
