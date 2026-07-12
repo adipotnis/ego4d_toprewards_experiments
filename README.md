@@ -16,7 +16,26 @@ For every Ego4D clip (egocentric video + narration caption) the script computes:
 
 - `topreward_test.py` — the experiment script. Self-contained loader for `mderry/ego4d-manipulation-v1` (LeRobot v3.0 format, no `lerobot` dep), logits reward, progress curve, per-sample plots. Supports both **Qwen3-VL** (via `qwen-vl-utils`) and **Molmo2** (via `molmo-utils`, timestamp-based video metadata) — the model family is auto-detected from the `--model` id (anything containing `molmo` takes the Molmo2 path). Both families score the same answer span, so VOC / reward stay directly comparable.
 - `compare_models.py` — side-by-side comparison across multiple VLMs.
+- `make_subgoal_videos.py` — renders a synced mp4 per episode for a `--split-subgoals` run: the real clip plays on top while a cursor sweeps each subgoal's progress curve (shown side by side below) in sync. Encodes via PyAV, no ffmpeg binary needed.
 - `run_topreward_test.sbatch` — Slurm submission script (gitignored — cluster-specific).
+
+### Per-subgoal mode
+
+Ego4D captions are sequences of atomic sub-actions ("subgoals") joined by a comma
+(most end each with a period, `"., "`; some use a plain `", "`). Passing
+`--split-subgoals` (env `SPLIT_SUBGOALS=1` for the sbatch) splits each caption into
+its subgoals and scores/plots **each subgoal independently over the whole clip** —
+there are no per-subgoal frame boundaries in the data, so every subgoal gets its own
+progress curve + VOC. Output goes to a `..._subgoals/` dir: per-episode JSONL
+(`EpisodeResult` with a list of `SubgoalResult`), per-subgoal plots
+(`epNNNN_sgMM.png`), and one overlay per episode (`epNNNN_overlay.png`). The original
+per-episode path is unchanged.
+
+```bash
+NUM_SAMPLES=12 MODEL=Qwen/Qwen3-VL-8B-Instruct SPLIT_SUBGOALS=1 sbatch run_topreward_test.sbatch
+# then, on any node (CPU only):
+python make_subgoal_videos.py --jsonl runs/Qwen_Qwen3-VL-8B-Instruct_subgoals/topreward.jsonl
+```
 
 ## External paths
 

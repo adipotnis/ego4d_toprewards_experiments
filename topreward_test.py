@@ -79,6 +79,44 @@ class Ego4DSample:
 
 
 @dataclass
+class SubgoalResult:
+    """One sub-action of an episode caption, scored on its own over the full clip.
+
+    Field-compatible with `plot_sample` (episode_index, caption, voc, reward_mean,
+    answer_token_prob, prefix_frame_counts, progress) so the existing per-sample
+    plotter renders a subgoal without changes. `caption` holds the subgoal text.
+    """
+
+    episode_index: int
+    subgoal_index: int
+    caption: str  # the subgoal (sub-action) text
+    num_frames: int
+    reward_mean: float
+    reward_sum: float
+    answer_token_logprob: float
+    answer_token_prob: float
+    token_count: int
+    per_token_log_probs: list = field(default_factory=list)
+    prefix_frame_counts: list = field(default_factory=list)
+    prefix_rewards: list = field(default_factory=list)
+    progress: list = field(default_factory=list)
+    voc: float = float("nan")
+    error: str | None = None
+
+
+@dataclass
+class EpisodeResult:
+    """An episode's full caption split into subgoals, each scored independently."""
+
+    episode_index: int
+    task_index: int
+    full_caption: str
+    num_frames: int
+    num_subgoals: int
+    subgoals: list = field(default_factory=list)  # list[SubgoalResult]
+
+
+@dataclass
 class SampleResult:
     episode_index: int
     task_index: int
@@ -188,6 +226,34 @@ def load_ego4d_samples(num_samples: int, cache_dir: str) -> list[Ego4DSample]:
             print(f"[load] sample {len(samples):>2}/{num_samples} ep={ep['episode_index'][i]} frames={len(frames)} caption={caption[:60]!r}")
         meta_file_idx += 1
     return samples
+
+
+def split_subgoals(caption: str) -> list[str]:
+    """Split an Ego4D narration into its constituent sub-actions ("subgoals").
+
+    Ego4D captions concatenate sub-actions with a comma; most end each
+    sub-action with a period ("., "), but a chunk of the data uses a plain
+    comma (", ") instead, e.g.
+        "carries the bowl., touches the contents., pours the contents."
+        "places the wand on the floor, picks the bottle, shakes the bottle"
+    Both are handled by splitting on a comma with an optional preceding period.
+    Each piece is normalised to end in a single ".".
+
+        -> ["carries the bowl.", "touches the contents.", "pours the contents."]
+
+    A caption with no comma yields one subgoal (the whole caption). Empty pieces
+    are dropped; duplicate sub-actions are kept (they recur in the data and map
+    to distinct moments in the video). Individual Ego4D sub-actions do not
+    contain commas, so this does not over-split.
+    """
+    import re
+
+    subgoals: list[str] = []
+    for part in re.split(r"\.?\s*,\s*", caption):
+        part = part.strip().rstrip(".").strip()
+        if part:
+            subgoals.append(part + ".")
+    return subgoals
 
 
 def _uniform_subsample(frames: list, n: int) -> list:
@@ -496,6 +562,41 @@ def plot_sample(res: "SampleResult", frames: list, out_png: Path, max_keyframes:
     plt.close(fig)
 
 
+def plot_episode_overlay(ep: "EpisodeResult", out_png: Path) -> None:
+    """Overlay every subgoal's progress curve for one episode on shared axes.
+
+    Each subgoal is scored independently over the same full clip, so the curves
+    are directly comparable: which sub-action the model reads as "completing" as
+    the video plays out, and how monotonic (VOC) each one is.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    subs = [s for s in ep.subgoals if s.error is None and s.prefix_frame_counts and s.progress]
+    if not subs:
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+    cmap = plt.get_cmap("tab10")
+    for i, s in enumerate(subs):
+        label = f"[{s.subgoal_index}] VOC={s.voc:.2f}  {s.caption[:48]}"
+        ax.plot(s.prefix_frame_counts, s.progress, "-o", color=cmap(i % 10), lw=1.8, ms=4, label=label)
+    ax.set_xlabel("prefix length (# frames shown)")
+    ax.set_ylabel("predicted progress  [0, 1]")
+    ax.set_ylim(-0.05, 1.08)
+    ax.grid(alpha=0.3)
+    ax.set_title(
+        f"ep {ep.episode_index} — {ep.num_subgoals} subgoals scored over the full clip",
+        fontsize=10,
+        loc="left",
+    )
+    ax.legend(loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=7, title="subgoal")
+    fig.savefig(out_png, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ----------------------------------------------------------------------------
 # Model loading + orchestration.
 # ----------------------------------------------------------------------------
@@ -593,7 +694,97 @@ def run(num_samples: int, model_name: str, out_path: str, cache_dir: str, max_fr
     _summarize(results, model_name, out)
 
 
-def _summarize(results: list[SampleResult], model_name: str, out: Path) -> None:
+def run_subgoals(num_samples: int, model_name: str, out_path: str, cache_dir: str, max_frames: int, num_prefixes: int, plots_dir: str | None) -> None:
+    """Per-subgoal variant of `run`: split each episode caption into sub-actions
+    and score/plot each subgoal independently over the full clip.
+
+    Writes one JSONL line per episode (an `EpisodeResult` with its subgoals), and
+    for each episode emits per-subgoal plots (`epNNNN_sgMM.png`) plus one overlay
+    figure (`epNNNN_overlay.png`) with all subgoal progress curves together.
+    """
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plots = Path(plots_dir) if plots_dir else None
+    if plots:
+        plots.mkdir(parents=True, exist_ok=True)
+
+    samples = load_ego4d_samples(num_samples, cache_dir=cache_dir)
+    print(f"[run] loaded {len(samples)} Ego4D samples")
+
+    model, processor = load_model(model_name)
+    is_molmo = _is_molmo(model_name)
+
+    all_subgoals: list[SubgoalResult] = []
+    with out.open("w", encoding="utf-8") as fh:
+        for i, s in enumerate(samples):
+            frames = _uniform_subsample(s.frames, max_frames)
+            subgoals = split_subgoals(s.caption)
+            print(f"[run] {i + 1}/{len(samples)} ep={s.episode_index} frames={len(frames)} subgoals={len(subgoals)}")
+            sg_results: list[SubgoalResult] = []
+            for j, sg in enumerate(subgoals):
+                print(f"    subgoal {j + 1}/{len(subgoals)} :: {sg[:70]!r}")
+                try:
+                    rw = logits_reward(model, processor, frames, sg, s.fps, reduction="mean", is_molmo=is_molmo)
+                    pg = progress_curve(model, processor, frames, sg, s.fps, num_prefixes=num_prefixes, is_molmo=is_molmo)
+                    sr = SubgoalResult(
+                        episode_index=s.episode_index,
+                        subgoal_index=j,
+                        caption=sg,
+                        num_frames=len(frames),
+                        reward_mean=rw["reward_mean"],
+                        reward_sum=rw["reward_sum"],
+                        answer_token_logprob=rw["answer_token_logprob"],
+                        answer_token_prob=rw["answer_token_prob"],
+                        token_count=rw["token_count"],
+                        per_token_log_probs=rw["per_token_log_probs"],
+                        prefix_frame_counts=pg["prefix_frame_counts"],
+                        prefix_rewards=pg["prefix_rewards"],
+                        progress=pg["progress"],
+                        voc=pg["voc"],
+                    )
+                    print(f"        reward_mean={sr.reward_mean:.4f}  P(True)={sr.answer_token_prob:.4f}  VOC={sr.voc:.4f}")
+                    if plots is not None:
+                        try:
+                            plot_sample(sr, frames, plots / f"ep{s.episode_index:04d}_sg{j:02d}.png")
+                        except Exception as pexc:  # noqa: BLE001 - plotting must not kill the run
+                            print(f"        plot failed: {pexc!r}")
+                except Exception as exc:  # noqa: BLE001 - record and continue
+                    sr = SubgoalResult(
+                        episode_index=s.episode_index,
+                        subgoal_index=j,
+                        caption=sg,
+                        num_frames=len(frames),
+                        reward_mean=float("nan"),
+                        reward_sum=float("nan"),
+                        answer_token_logprob=float("nan"),
+                        answer_token_prob=float("nan"),
+                        token_count=0,
+                        error=repr(exc),
+                    )
+                    print(f"        ERROR: {exc!r}")
+                sg_results.append(sr)
+                all_subgoals.append(sr)
+
+            ep_res = EpisodeResult(
+                episode_index=s.episode_index,
+                task_index=s.task_index,
+                full_caption=s.caption,
+                num_frames=len(frames),
+                num_subgoals=len(subgoals),
+                subgoals=sg_results,
+            )
+            if plots is not None:
+                try:
+                    plot_episode_overlay(ep_res, plots / f"ep{s.episode_index:04d}_overlay.png")
+                except Exception as pexc:  # noqa: BLE001 - plotting must not kill the run
+                    print(f"        overlay plot failed: {pexc!r}")
+            fh.write(json.dumps(asdict(ep_res), ensure_ascii=False) + "\n")
+            fh.flush()
+
+    _summarize(all_subgoals, model_name, out)
+
+
+def _summarize(results: "list[SampleResult] | list[SubgoalResult]", model_name: str, out: Path) -> None:
     ok = [r for r in results if r.error is None]
     rewards = np.array([r.reward_mean for r in ok], dtype=float)
     probs = np.array([r.answer_token_prob for r in ok], dtype=float)
@@ -632,8 +823,14 @@ def main() -> None:
     p.add_argument("--max-frames", type=int, default=12, help="max frames per clip fed to the model")
     p.add_argument("--num-prefixes", type=int, default=8, help="prefix points for the progress curve")
     p.add_argument("--plots-dir", default="runs/plots", help="dir for per-sample progress+keyframe plots ('' to disable)")
+    p.add_argument(
+        "--split-subgoals",
+        action="store_true",
+        help="split each episode caption into its sub-actions and score/plot each subgoal independently over the full clip",
+    )
     args = p.parse_args()
-    run(
+    runner = run_subgoals if args.split_subgoals else run
+    runner(
         num_samples=args.num_samples,
         model_name=args.model,
         out_path=args.out,
