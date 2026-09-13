@@ -8,6 +8,10 @@ using Qwen3-VL or Molmo2. This repo runs independently of the upstream TOPReward
 - **Progress:** rewards over clip prefixes, normalized to [0, 1].
 - **VOC:** Spearman correlation of progress with time; higher means more consistently increasing progress.
 
+![Qwen3-VL-2B progress curve with six Ego4D video keyframes](runs/Qwen_Qwen3-VL-2B-Instruct/plots/ep0000.png)
+
+*Example output: predicted progress and video keyframes for one Ego4D clip.*
+
 ## Quick start
 
 Requires Python 3.11+, [uv](https://github.com/astral-sh/uv), and an NVIDIA GPU for inference.
