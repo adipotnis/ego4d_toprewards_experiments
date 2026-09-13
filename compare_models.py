@@ -19,19 +19,11 @@ from pathlib import Path
 
 import numpy as np
 
-
-def _load(run_dir: Path) -> list[dict]:
-    p = run_dir / "topreward.jsonl"
-    if not p.exists():
-        return []
-    return [json.loads(line) for line in p.open() if line.strip()]
+import topreward_test as tr
 
 
-def _stats(vals: list[float]) -> dict:
-    a = np.array([v for v in vals if v is not None and not (isinstance(v, float) and np.isnan(v))], dtype=float)
-    if a.size == 0:
-        return {"n": 0, "mean": float("nan"), "std": float("nan"), "min": float("nan"), "max": float("nan")}
-    return {"n": int(a.size), "mean": float(a.mean()), "std": float(a.std()), "min": float(a.min()), "max": float(a.max())}
+def _short_tag(tag: str) -> str:
+    return tag.replace("Qwen_", "").replace("allenai_", "")
 
 
 def main() -> None:
@@ -47,40 +39,40 @@ def main() -> None:
         print(f"No model runs found under {runs}/*/topreward.jsonl")
         return
 
-    per_model: dict[str, list[dict]] = {}
+    by_ep: dict[str, dict[int, dict]] = {}  # tag -> episode_index -> row
     summary: dict[str, dict] = {}
     for d in model_dirs:
-        rows = [r for r in _load(d) if r.get("error") is None]
+        rows = [r for r in tr.read_jsonl(d / "topreward.jsonl") if r.get("error") is None]
         if not rows:
             continue
         tag = d.name
-        per_model[tag] = rows
+        by_ep[tag] = {r["episode_index"]: r for r in rows}
         summary[tag] = {
             "num_valid": len(rows),
-            "voc": _stats([r["voc"] for r in rows]),
-            "reward_mean": _stats([r["reward_mean"] for r in rows]),
-            "answer_prob": _stats([r["answer_token_prob"] for r in rows]),
+            "voc": tr.summary_stats(r["voc"] for r in rows),
+            "reward_mean": tr.summary_stats(r["reward_mean"] for r in rows),
+            "answer_prob": tr.summary_stats(r["answer_token_prob"] for r in rows),
         }
 
     (runs / "comparison.json").write_text(json.dumps(summary, indent=2))
 
+    # Models ordered by mean VOC, best first; used by the table and both figures.
+    order = sorted(summary, key=lambda t: summary[t]["voc"]["mean"], reverse=True)
+
     # --- markdown table ---
     print(f"\n{'model':<32} {'n':>4} {'VOC mean':>9} {'VOC std':>8} {'reward':>8} {'P(True)':>9}")
     print("-" * 76)
-    for tag, s in sorted(summary.items(), key=lambda kv: kv[1]["voc"]["mean"], reverse=True):
+    for tag in order:
+        s = summary[tag]
         v, r, p = s["voc"], s["reward_mean"], s["answer_prob"]
         print(f"{tag:<32} {s['num_valid']:>4} {v['mean']:>9.3f} {v['std']:>8.3f} {r['mean']:>8.2f} {p['mean']:>9.4f}")
 
     # --- VOC bar chart ---
-    import matplotlib
+    plt = tr.agg_pyplot()
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    order = sorted(summary, key=lambda t: summary[t]["voc"]["mean"], reverse=True)
     means = [summary[t]["voc"]["mean"] for t in order]
     stds = [summary[t]["voc"]["std"] for t in order]
-    labels = [t.replace("Qwen_", "").replace("allenai_", "") for t in order]
+    labels = [_short_tag(t) for t in order]
 
     fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(order)), 5), constrained_layout=True)
     bars = ax.bar(labels, means, yerr=stds, capsize=5, color="#4c72b0", alpha=0.9)
@@ -105,17 +97,13 @@ def main() -> None:
         ax = axes[k // ncol][k % ncol]
         cap = ""
         for tag in order:
-            row = next((r for r in per_model[tag] if r["episode_index"] == ep), None)
+            row = by_ep[tag].get(ep)
             if row is None or not row.get("progress"):
                 continue
             cap = row["caption"]
-            ax.plot(row["prefix_frame_counts"], row["progress"], "-o", ms=3, lw=1.5,
-                    color=model_color[tag], label=tag.replace("Qwen_", "").replace("allenai_", ""))
+            ax.plot(row["prefix_frame_counts"], row["progress"], "-o", ms=3, lw=1.5, color=model_color[tag], label=_short_tag(tag))
         ax.set_title(f"ep {ep}: {cap[:48]}", fontsize=8, loc="left")
-        ax.set_xlabel("prefix length (# frames)")
-        ax.set_ylabel("progress")
-        ax.set_ylim(-0.05, 1.08)
-        ax.grid(alpha=0.3)
+        tr.style_progress_axis(ax)
         if k == 0:
             ax.legend(fontsize=7, loc="lower right")
     for k in range(len(eps), nrow * ncol):

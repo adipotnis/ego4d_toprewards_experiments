@@ -15,8 +15,9 @@ with a dot riding the (interpolated) curve. Each subplot is titled with its
 subgoal text + VOC.
 
 Reads the curves from the run's JSONL (one EpisodeResult per line) and re-decodes
-the full episode frames via `topreward_test.load_ego4d_samples` (CPU only, uses
-the cached videos in HF_HOME). Encodes mp4 with PyAV (no ffmpeg binary needed).
+the full frames of exactly those episodes via `topreward_test.load_ego4d_samples`
+(CPU only, uses the cached videos in HF_HOME). Encodes mp4 with PyAV (no ffmpeg
+binary needed).
 
     python make_subgoal_videos.py \
         --jsonl runs/Qwen_Qwen3-VL-8B-Instruct_subgoals/topreward.jsonl \
@@ -26,21 +27,11 @@ the cached videos in HF_HOME). Encodes mp4 with PyAV (no ffmpeg binary needed).
 from __future__ import annotations
 
 import argparse
-import json
-import textwrap
 from pathlib import Path
 
 import numpy as np
 
 import topreward_test as tr
-
-
-def _wrap_title(text: str, width: int = 22, max_lines: int = 3) -> str:
-    lines = textwrap.wrap(text, width=width)
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1].rstrip(".") + "…"
-    return "\n".join(lines)
 
 
 def _even(n: int) -> int:
@@ -50,10 +41,8 @@ def _even(n: int) -> int:
 def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_frames: int, out_fps: int, dpi: int = 100) -> bool:
     """Render one episode's synced video. Returns True on success."""
     import av
-    import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = tr.agg_pyplot()
 
     subs = [s for s in ep["subgoals"] if s.get("error") is None and s.get("prefix_frame_counts") and s.get("progress")]
     n = len(subs)
@@ -62,8 +51,7 @@ def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_fram
 
     # Subsample the top-panel frames for rendering (keeps encode time bounded while
     # still smooth). These are only for display; the curves are unchanged.
-    ridx = np.linspace(0, len(frames) - 1, min(len(frames), max_render_frames)).round().astype(int)
-    vid = [frames[i] for i in ridx]
+    vid = tr.uniform_subsample(frames, max_render_frames)
     total = len(vid)
 
     # --- figure: top video spans all columns, one subplot per subgoal below ---
@@ -82,18 +70,18 @@ def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_fram
     cursors = []  # (xs, ys, vline, dot)
     for j, s in enumerate(subs):
         ax = fig.add_subplot(gs[1, j])
-        xs = np.asarray(s["prefix_frame_counts"], dtype=float)
+        xs = np.asarray(s["prefix_frame_counts"], dtype=float)  # ascending
         ys = np.asarray(s["progress"], dtype=float)
-        ax.plot(xs, ys, "-", color="#1f77b4", lw=1.4)
-        ax.plot(xs, ys, ".", color="#1f77b4", ms=3)
-        vline = ax.axvline(xs[0], color="crimson", lw=1.3)
-        (dot,) = ax.plot([xs[0]], [ys[0]], "o", color="crimson", ms=6, zorder=5)
+        x0, x1 = float(xs[0]), float(xs[-1])
+        ax.plot(xs, ys, ".-", color="#1f77b4", lw=1.4, ms=3)
+        vline = ax.axvline(x0, color="crimson", lw=1.3)
+        (dot,) = ax.plot([x0], [ys[0]], "o", color="crimson", ms=6, zorder=5)
         ax.set_ylim(-0.05, 1.08)
-        ax.set_xlim(float(xs.min()), float(xs.max()))
+        ax.set_xlim(x0, x1)
         voc = s.get("voc", float("nan"))
-        ax.set_title(f"[{s['subgoal_index']}] VOC={voc:.2f}\n{_wrap_title(s['caption'])}", fontsize=6.5)
+        ax.set_title(f"[{s['subgoal_index']}] VOC={voc:.2f}\n{tr.wrap_title(s['caption'], width=22)}", fontsize=6.5)
         ax.tick_params(labelsize=6)
-        ax.set_xticks([float(xs.min()), float(xs.max())])
+        ax.set_xticks([x0, x1])
         if j == 0:
             ax.set_ylabel("progress [0,1]", fontsize=7)
         else:
@@ -146,16 +134,15 @@ def main() -> None:
     p.add_argument("--episodes", default="", help="comma-separated episode indices to render (default: all in the jsonl)")
     args = p.parse_args()
 
-    episodes = [json.loads(line) for line in Path(args.jsonl).read_text().splitlines() if line.strip()]
-    want = {int(x) for x in args.episodes.split(",") if x.strip()} if args.episodes else None
-    if want is not None:
+    episodes = tr.read_jsonl(Path(args.jsonl))
+    if args.episodes:
+        want = {int(x) for x in args.episodes.split(",") if x.strip()}
         episodes = [e for e in episodes if e["episode_index"] in want]
     n_eps = len(episodes)
 
-    # Re-decode full frames for exactly the episodes we need. load_ego4d_samples walks
-    # episodes in index order, so pull enough to cover the highest index requested.
-    max_idx = max(e["episode_index"] for e in episodes)
-    samples = tr.load_ego4d_samples(max_idx + 1, cache_dir=args.cache_dir)
+    # Re-decode full frames for exactly the episodes we need.
+    need = {e["episode_index"] for e in episodes}
+    samples = tr.load_ego4d_samples(len(need), cache_dir=args.cache_dir, episode_indices=need)
     frames_by_ep = {s.episode_index: s.frames for s in samples}
 
     out_dir = Path(args.out_dir)
