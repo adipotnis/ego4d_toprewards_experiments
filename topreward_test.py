@@ -1,51 +1,7 @@
-"""topreward_test.py — single-file TOPReward-style reward, tested on Ego4D.
+"""TOPReward-style logit rewards and progress curves for Ego4D.
 
-This is a self-contained re-implementation of the core TOPReward idea
-("Token Probabilities as Zero-Shot Rewards"): use a vision-language model and
-read the answer **logits** to score how well a video matches a text caption,
-instead of asking the model to emit a number.
-
-For every Ego4D clip (real first-person video + its narration caption) we
-compute two things the user asked for:
-
-  * LOGITS reward
-      Build the prompt  [video frames] + "... completes the following task:
-      {caption} ... The answer is: True", run a single forward pass, and read
-      the model's output logits. The reward is the per-token log-probability
-      (log_softmax of the logits, gathered at the gold token ids) of the
-      answer span. Higher == the model is more confident the video completes
-      the caption. This is exactly the signal TOPReward uses
-      (see topreward/clients/qwen.py::compute_instruction_reward).
-
-  * PROGRESS curve
-      Recompute the logits reward on trajectory *prefixes* (the first k frames,
-      for k uniformly spaced over the clip), then min-max normalise the reward
-      curve to [0, 1]. A well-behaved reward rises as more of the task is shown,
-      so this normalised curve is the model's predicted task-completion
-      ("progress") over time. We summarise its monotonicity with VOC
-      (Value-Order Correlation = Spearman corr. of the curve vs. chronological
-      order), the same metric used in topreward/metrics/voc.py.
-
-Data
-----
-mderry/ego4d-manipulation-v1 — Ego4D re-packaged in LeRobot v3.0 format. It
-bundles the egocentric mp4 video together with a per-episode task narration,
-so no gated Ego4D download is required. Each episode maps to a [start, end]
-frame range inside a chunked mp4; captions live in meta/tasks.parquet.
-
-Run
----
-    python topreward_test.py --num-samples 40 \
-        --model Qwen/Qwen3-VL-4B-Instruct --out runs/ego4d_topreward.jsonl
-
-It is named *topreward_test.py (not test_*.py) on purpose so pytest does not
-collect it — it is a runnable experiment script, not a unit test.
-
-`make_subgoal_videos.py` and `compare_models.py` import the small shared helpers
-defined here (loader, subsampling, JSONL/stats/plot utilities); the heavy
-imports (torch, transformers, av, matplotlib) are all lazy so importing this
-module is cheap.
-"""
+Supports Qwen-VL and Molmo2; heavy dependencies are imported lazily.
+Run with --help for options."""
 
 from __future__ import annotations
 
@@ -60,9 +16,6 @@ from typing import Any
 
 import numpy as np
 
-# ----------------------------------------------------------------------------
-# Constants for the Ego4D / LeRobot-v3.0 source dataset.
-# ----------------------------------------------------------------------------
 EGO4D_REPO = "mderry/ego4d-manipulation-v1"
 EGO4D_SUBROOT = "0000"  # the dataset nests several LeRobot roots; use the first
 EGO4D_FPS = 10.0  # native fps from 0000/meta/info.json
@@ -76,9 +29,6 @@ ANSWER_WORD = " True"
 NAN = float("nan")
 
 
-# ----------------------------------------------------------------------------
-# Data structures.
-# ----------------------------------------------------------------------------
 @dataclass
 class Ego4DSample:
     episode_index: int
@@ -88,22 +38,10 @@ class Ego4DSample:
     fps: float
 
 
-# The reward fields below default to NaN/empty so a failed clip is recorded as
-# `Result(<identity>, error=repr(exc))`. Their names match the keys returned by
-# `score_clip`, so a successful clip is `Result(<identity>, **score_clip(...))`.
-@dataclass
-class SubgoalResult:
-    """One sub-action of an episode caption, scored on its own over the full clip.
+@dataclass(kw_only=True)
+class ScoreResult:
+    """Shared reward and progress fields; failed scores keep NaN/empty defaults."""
 
-    Field-compatible with `plot_sample` (episode_index, caption, voc, reward_mean,
-    answer_token_prob, prefix_frame_counts, progress) so the existing per-sample
-    plotter renders a subgoal without changes. `caption` holds the subgoal text.
-    """
-
-    episode_index: int
-    subgoal_index: int
-    caption: str  # the subgoal (sub-action) text
-    num_frames: int
     reward_mean: float = NAN
     reward_sum: float = NAN
     answer_token_logprob: float = NAN
@@ -118,6 +56,24 @@ class SubgoalResult:
 
 
 @dataclass
+class SampleResult(ScoreResult):
+    episode_index: int
+    task_index: int
+    caption: str
+    num_frames: int
+
+
+@dataclass
+class SubgoalResult(ScoreResult):
+    """One sub-action scored over the full clip."""
+
+    episode_index: int
+    subgoal_index: int
+    caption: str
+    num_frames: int
+
+
+@dataclass
 class EpisodeResult:
     """An episode's full caption split into subgoals, each scored independently."""
 
@@ -126,33 +82,9 @@ class EpisodeResult:
     full_caption: str
     num_frames: int
     num_subgoals: int
-    subgoals: list = field(default_factory=list)  # list[SubgoalResult]
+    subgoals: list[SubgoalResult] = field(default_factory=list)
 
 
-@dataclass
-class SampleResult:
-    episode_index: int
-    task_index: int
-    caption: str
-    num_frames: int
-    # --- logits reward (full clip) ---
-    reward_mean: float = NAN  # mean per-token log-prob of the answer span
-    reward_sum: float = NAN  # summed log-prob
-    answer_token_logprob: float = NAN  # log-prob of the decisive " True" token
-    answer_token_prob: float = NAN  # exp() of the above, in [0, 1]
-    token_count: int = 0
-    per_token_log_probs: list = field(default_factory=list)
-    # --- progress curve ---
-    prefix_frame_counts: list = field(default_factory=list)
-    prefix_rewards: list = field(default_factory=list)  # raw mean log-prob per prefix
-    progress: list = field(default_factory=list)  # min-max normalised -> [0,1]
-    voc: float = NAN  # Spearman(progress, chronological order)
-    error: str | None = None
-
-
-# ----------------------------------------------------------------------------
-# Small shared utilities (also used by make_subgoal_videos.py / compare_models.py).
-# ----------------------------------------------------------------------------
 def read_jsonl(path: Path) -> list[dict]:
     with Path(path).open(encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
@@ -161,7 +93,7 @@ def read_jsonl(path: Path) -> list[dict]:
 def summary_stats(vals: Iterable[float | None]) -> dict:
     """n / mean / std / min / max over the finite values (None and NaN dropped)."""
     a = np.asarray(list(vals), dtype=float)
-    a = a[~np.isnan(a)]
+    a = a[np.isfinite(a)]
     if a.size == 0:
         return {"n": 0, "mean": NAN, "std": NAN, "min": NAN, "max": NAN}
     return {"n": int(a.size), "mean": float(a.mean()), "std": float(a.std()), "min": float(a.min()), "max": float(a.max())}
@@ -196,15 +128,8 @@ def style_progress_axis(ax) -> None:
     ax.grid(alpha=0.3)
 
 
-# ----------------------------------------------------------------------------
-# Ego4D loading (self-contained; no lerobot dependency).
-# ----------------------------------------------------------------------------
 def _decode_frames(video_path: str, start: int, end: int) -> list:
-    """Decode frames [start, end] (inclusive) from an mp4 using PyAV.
-
-    Frame indices are relative to the given video file (verified against the
-    dataset: each video file restarts its frame numbering at 0).
-    """
+    """Decode the inclusive [start, end] range using file-relative frame indices."""
     import av
 
     frames: list = []
@@ -241,14 +166,13 @@ def load_ego4d_samples(
     max_frames: int | None = None,
     episode_indices: set[int] | None = None,
 ) -> list[Ego4DSample]:
-    """Download metadata + the needed video files and build samples.
+    """Load usable episodes in dataset order, optionally filtering episode indices.
 
-    Walks episodes in dataset order, decoding each referenced video file on
-    demand, until `num_samples` usable episodes (>= 2 frames, non-empty caption)
-    are collected. With `episode_indices`, only those episodes are decoded and
-    the walk stops once all of them are found. With `max_frames`, each sample
-    keeps only that many uniformly spaced frames.
-    """
+    Each sample needs a caption and at least two frames. max_frames limits the
+    retained frames through uniform subsampling."""
+    if num_samples <= 0 or episode_indices == set():
+        return []
+
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
 
@@ -260,12 +184,11 @@ def load_ego4d_samples(
             cache_dir=cache_dir,
         )
 
-    # task_index -> caption
     tasks = pq.read_table(dl("meta/tasks.parquet")).to_pydict()
     caption_of = dict(zip(tasks["task_index"], tasks["task"], strict=False))
 
     samples: list[Ego4DSample] = []
-    video_cache: dict[int, str] = {}
+    video_cache: dict[tuple[int, int], str] = {}
     pending = set(episode_indices) if episode_indices is not None else None
     for row in _iter_episode_rows(dl):
         if len(samples) >= num_samples or (pending is not None and not pending):
@@ -276,9 +199,10 @@ def load_ego4d_samples(
                 continue
             pending.discard(epi)
         vfi, vci = int(row["video_file_index"]), int(row["video_chunk_index"])
-        if vfi not in video_cache:
-            video_cache[vfi] = dl(f"videos/{VIDEO_KEY}/chunk-{vci:03d}/file-{vfi:03d}.mp4")
-        frames = _decode_frames(video_cache[vfi], int(row["start_frame"]), int(row["end_frame"]))
+        video_key = (vci, vfi)
+        if video_key not in video_cache:
+            video_cache[video_key] = dl(f"videos/{VIDEO_KEY}/chunk-{vci:03d}/file-{vfi:03d}.mp4")
+        frames = _decode_frames(video_cache[video_key], int(row["start_frame"]), int(row["end_frame"]))
         if len(frames) < 2:
             continue  # need >=2 frames for a trajectory
         if max_frames is not None:
@@ -293,37 +217,17 @@ def load_ego4d_samples(
 
 
 def split_subgoals(caption: str) -> list[str]:
-    """Split an Ego4D narration into its constituent sub-actions ("subgoals").
+    """Split comma-separated actions, drop empty pieces, and normalize periods.
 
-    Ego4D captions concatenate sub-actions with a comma; most end each
-    sub-action with a period ("., "), but a chunk of the data uses a plain
-    comma (", ") instead, e.g.
-        "carries the bowl., touches the contents., pours the contents."
-        "places the wand on the floor, picks the bottle, shakes the bottle"
-    Both are handled by splitting on a comma with an optional preceding period.
-    Each piece is normalised to end in a single ".".
-
-        -> ["carries the bowl.", "touches the contents.", "pours the contents."]
-
-    A caption with no comma yields one subgoal (the whole caption). Empty pieces
-    are dropped; duplicate sub-actions are kept (they recur in the data and map
-    to distinct moments in the video). Individual Ego4D sub-actions do not
-    contain commas, so this does not over-split.
-    """
-    import re
-
+    Repeated actions are preserved as distinct subgoals."""
     subgoals: list[str] = []
-    for part in re.split(r"\.?\s*,\s*", caption):
+    for part in caption.split(","):
         part = part.strip().rstrip(".").strip()
         if part:
             subgoals.append(part + ".")
     return subgoals
 
 
-# ----------------------------------------------------------------------------
-# Model families: everything that differs between Qwen-VL and Molmo2 lives here.
-# The reward math below is family-agnostic and only sees a `VLM`.
-# ----------------------------------------------------------------------------
 @dataclass
 class VLM:
     """A loaded model + processor and the family-specific forward-input builder."""
@@ -351,7 +255,7 @@ def _vision_info(messages):
     """qwen_vl_utils.process_vision_info, tolerant of 2- or 3-tuple returns."""
     from qwen_vl_utils import process_vision_info
 
-    out = process_vision_info(messages)
+    out: Any = process_vision_info(messages)
     if isinstance(out, tuple) and len(out) == 3:
         image_inputs, video_inputs, video_kwargs = out
     else:
@@ -361,10 +265,9 @@ def _vision_info(messages):
 
 
 def _strip_trailing_eos(processor, prompt_chat: str) -> str:
-    """Strip only the FINAL turn-closing eos so the scored text continues the
-    user turn. Using rsplit (last eos) — not split (first eos) — is crucial for
-    templates that prepend a system message (e.g. Qwen2.5-VL); splitting on the
-    first eos would discard the user turn and all vision tokens."""
+    """Remove the last EOS so scoring continues the user turn.
+
+    Keep earlier EOS tokens: templates may include a preceding system turn."""
     eos = getattr(processor.tokenizer, "eos_token", None)
     if eos and eos in prompt_chat:
         return prompt_chat.rsplit(eos, 1)[0]
@@ -372,12 +275,7 @@ def _strip_trailing_eos(processor, prompt_chat: str) -> str:
 
 
 def _qwen_inputs(vlm: VLM, pil_frames: list, fps: float, prompt_text: str, scored_text: str):
-    """Build (forward inputs, prompt_len) for a Qwen-VL-style processor.
-
-    Renders the chat prefix (video + prompt_text) WITHOUT a generation prompt,
-    strips a trailing eos, then appends the span we want to score. Mirrors
-    topreward/clients/qwen.py.
-    """
+    """Build Qwen inputs and the unscored prompt length, without a generation prompt."""
     processor = vlm.processor
     messages = [
         {
@@ -404,18 +302,13 @@ def _qwen_inputs(vlm: VLM, pil_frames: list, fps: float, prompt_text: str, score
 
 
 def _molmo_inputs(vlm: VLM, pil_frames: list, fps: float, prompt_text: str, scored_text: str):
-    """Build (forward inputs, prompt_len) for a Molmo2 processor.
+    """Build Molmo2 inputs and prompt length using frame-index timestamps.
 
-    Molmo2 uses molmo_utils.process_vision_info (timestamp-based video metadata)
-    rather than qwen_vl_utils, and the processor takes videos= + video_metadata=
-    with the text as a plain string. Mirrors topreward/clients/molmo.py. The
-    answer span scored is the same as the Qwen path, so VOC/reward stay comparable.
-    `fps` is unused: Molmo2 takes frame-index timestamps instead.
-    """
+    Molmo2 uses video metadata instead of fps; the scored text matches Qwen."""
     try:
         from molmo_utils import process_vision_info as molmo_vision_info
     except ImportError as exc:
-        raise ImportError("molmo_utils is required to run Molmo2 models. Install it with " "`uv add molmo_utils` (or `pip install molmo-utils`).") from exc
+        raise ImportError("molmo_utils is required to run Molmo2 models. Install it with `uv add molmo_utils` (or `pip install molmo-utils`).") from exc
 
     processor = vlm.processor
     messages = [
@@ -452,9 +345,7 @@ def _molmo_inputs(vlm: VLM, pil_frames: list, fps: float, prompt_text: str, scor
 
 # First matching family wins; the last entry (match=None) is the default.
 _FAMILIES = (
-    # Molmo2 ships custom modeling code and prefers flash-attention-2; degrade
-    # through sdpa to eager so the run still works wherever flash-attn isn't
-    # built or the custom model rejects a kernel.
+    # Fall back when flash-attn or a kernel is unavailable.
     _Family(match="molmo", trust_remote_code=True, attn_candidates=("flash_attention_2", "sdpa", "eager"), build_inputs=_molmo_inputs),
     _Family(match=None, trust_remote_code=False, attn_candidates=("sdpa",), build_inputs=_qwen_inputs),
 )
@@ -493,26 +384,18 @@ def load_model(model_name: str) -> VLM:
     return VLM(model=model, processor=processor, build_inputs=fam.build_inputs)
 
 
-# ----------------------------------------------------------------------------
-# The TOPReward core: read the answer logits.
-# ----------------------------------------------------------------------------
 def logits_reward(vlm: VLM, frames: list, caption: str, fps: float) -> dict:
-    """Score a (video, caption) pair by the log-prob of the answer span.
+    """Return answer-span log probabilities for a video and caption.
 
-    Builds  [video] + PROMPT_PREFIX + caption + ANSWER_LEADIN + " True", runs a
-    single forward pass, and reads log_softmax(logits) at the gold tokens of the
-    answer span (the caption restatement + the decisive " True"). This is the
-    TOPReward "token probabilities as rewards" signal.
-    """
+    The scored span is the caption, ANSWER_LEADIN, and " True"; video and
+    prompt tokens are excluded."""
     import torch
     import torch.nn.functional as F
 
     pil_frames = [_to_pil(f) for f in frames]
-    # Everything after the video that we want to *score* under the model logits.
     scored_text = f"{caption}{ANSWER_LEADIN}{ANSWER_WORD}"
 
-    # Forward-pass inputs and the prompt-prefix length (how many leading tokens
-    # to mask out — we only score the answer span, not the video/prompt).
+    # Exclude video and prompt tokens from the scored span.
     inputs, prompt_len = vlm.build_inputs(vlm, pil_frames, fps, PROMPT_PREFIX, scored_text)
 
     labels = inputs["input_ids"].clone()
@@ -523,10 +406,8 @@ def logits_reward(vlm: VLM, frames: list, caption: str, fps: float) -> dict:
     with torch.no_grad():
         outputs = vlm.model(**inputs)
 
-    # log p(token_t | < t): the logits at position t-1 predict token t. Only the
-    # answer span (t >= prompt_len) is scored, so slice it out *before* the
-    # vocab-wide float32 log_softmax rather than materialising it for the whole
-    # (video-token dominated) sequence.
+    # Position t-1 predicts token t. Slice before float32 log_softmax to
+    # avoid allocating vocabulary-wide probabilities for the video tokens.
     logits = outputs.logits[:, prompt_len - 1 : -1, :]
     target = labels[:, prompt_len:]
     log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -551,41 +432,32 @@ def logits_reward(vlm: VLM, frames: list, caption: str, fps: float) -> dict:
 
 
 def score_clip(vlm: VLM, frames: list, caption: str, fps: float, num_prefixes: int = 8) -> dict:
-    """Full-clip logits reward + prefix progress curve for one (video, caption).
+    """Score trajectory prefixes and normalize rewards to a progress curve.
 
-    Mirrors topreward/clients/qwen.py::compute_instruction_rewards_for_prefixes:
-    score the first k frames for k uniformly spaced in [2, N], then min-max
-    normalise the reward curve to [0, 1]. The last prefix is the full clip, so
-    its pass doubles as the full-clip reward. Returns the union of the
-    `logits_reward` keys and prefix_frame_counts / prefix_rewards / progress / voc.
-    """
+    The final prefix supplies the full-clip reward. VOC measures Spearman
+    correlation with time; constant or single-point curves have undefined VOC."""
     from scipy.stats import spearmanr
 
     n = len(frames)
-    lengths = sorted({int(x) for x in np.linspace(2, n, min(num_prefixes, n - 1))})
+    if n < 2 or num_prefixes < 1:
+        raise ValueError("scoring requires at least two frames and one prefix")
+    lengths = [n] if num_prefixes == 1 else sorted({int(x) for x in np.linspace(2, n, min(num_prefixes, n - 1))})
     per_prefix = [logits_reward(vlm, frames[:k], caption, fps) for k in lengths]
     rewards = [r["reward_mean"] for r in per_prefix]
 
     arr = np.asarray(rewards, dtype=float)
     if arr.size >= 2 and not np.allclose(arr, arr[0]):
         progress = ((arr - arr.min()) / (arr.max() - arr.min())).tolist()
-        voc = float(spearmanr(progress, np.arange(arr.size)).statistic)
+        correlation: Any = spearmanr(progress, np.arange(arr.size))
+        voc = float(correlation.statistic)
     else:
         progress, voc = np.ones_like(arr).tolist(), NAN
 
     return {**per_prefix[-1], "prefix_frame_counts": lengths, "prefix_rewards": rewards, "progress": progress, "voc": voc}
 
 
-# ----------------------------------------------------------------------------
-# Plotting: progress curve with the corresponding keyframes alongside.
-# ----------------------------------------------------------------------------
 def plot_sample(res: SampleResult | SubgoalResult, frames: list, out_png: Path, max_keyframes: int = 6) -> None:
-    """Save a figure: the progress curve on the left, the keyframes that each
-    prefix ends on shown as a vertical strip on the right side.
-
-    `frames` is the (subsampled) chronological frame list actually fed to the
-    model; prefix k ends on frames[k-1].
-    """
+    """Plot progress alongside keyframes; prefix k ends at frames[k - 1]."""
     plt = agg_pyplot()
 
     counts = res.prefix_frame_counts
@@ -593,28 +465,24 @@ def plot_sample(res: SampleResult | SubgoalResult, frames: list, out_png: Path, 
     if not counts or not progress:
         return
 
-    # Choose up to `max_keyframes` prefix points (evenly) to display as images.
     sel = uniform_subsample(list(range(len(counts))), max_keyframes)
     n_kf = len(sel)
 
     fig = plt.figure(figsize=(13, 5.2), constrained_layout=True)
     gs = fig.add_gridspec(n_kf, 3)
 
-    # --- progress curve (left 2/3) ---
     ax = fig.add_subplot(gs[:, :2])
     ax.plot(counts, progress, "-o", color="#1f77b4", lw=2, ms=6, label="progress (norm. logit reward)")
     style_progress_axis(ax)
     ax.set_title(
-        f"ep {res.episode_index} | VOC={res.voc:.3f} | " f"reward_mean={res.reward_mean:.3f} | P(True)={res.answer_token_prob:.3f}\n{wrap_title(res.caption)}",
+        f"ep {res.episode_index} | VOC={res.voc:.3f} | reward_mean={res.reward_mean:.3f} | P(True)={res.answer_token_prob:.3f}\n{wrap_title(res.caption)}",
         fontsize=9,
         loc="left",
     )
-    # mark the keyframe x-positions
     for j in sel:
         ax.axvline(counts[j], color="grey", ls=":", alpha=0.35)
     ax.legend(loc="lower right", fontsize=8)
 
-    # --- keyframe strip (right 1/3) ---
     for row, j in enumerate(sel):
         axk = fig.add_subplot(gs[row, 2])
         fidx = min(counts[j] - 1, len(frames) - 1)
@@ -628,12 +496,7 @@ def plot_sample(res: SampleResult | SubgoalResult, frames: list, out_png: Path, 
 
 
 def plot_episode_overlay(ep: EpisodeResult, out_png: Path) -> None:
-    """Overlay every subgoal's progress curve for one episode on shared axes.
-
-    Each subgoal is scored independently over the same full clip, so the curves
-    are directly comparable: which sub-action the model reads as "completing" as
-    the video plays out, and how monotonic (VOC) each one is.
-    """
+    """Overlay subgoal progress curves, each scored over the entire clip."""
     plt = agg_pyplot()
 
     subs = [s for s in ep.subgoals if s.error is None and s.prefix_frame_counts and s.progress]
@@ -656,9 +519,6 @@ def plot_episode_overlay(ep: EpisodeResult, out_png: Path) -> None:
     plt.close(fig)
 
 
-# ----------------------------------------------------------------------------
-# Orchestration.
-# ----------------------------------------------------------------------------
 def _prepare(num_samples: int, model_name: str, out_path: str, cache_dir: str | None, max_frames: int, plots_dir: str | None):
     """Shared run setup: output dirs, samples (already subsampled to max_frames), model."""
     out = Path(out_path)
@@ -697,61 +557,52 @@ def _write_record(fh, record) -> None:
     fh.flush()
 
 
-def run(num_samples: int, model_name: str, out_path: str, cache_dir: str | None, max_frames: int, num_prefixes: int, plots_dir: str | None) -> None:
+def _score_sample(vlm: VLM, sample: Ego4DSample, num_prefixes: int, plots: Path | None, *, split: bool):
+    """Score and plot an episode, optionally collecting independent subgoals."""
+    captions = split_subgoals(sample.caption) if split else [sample.caption]
+    results = []
+    for j, caption in enumerate(captions):
+        fields = _score_fields(vlm, sample.frames, caption, sample.fps, num_prefixes)
+        identity = {"episode_index": sample.episode_index, "caption": caption, "num_frames": len(sample.frames)}
+        result = SubgoalResult(subgoal_index=j, **identity, **fields) if split else SampleResult(task_index=sample.task_index, **identity, **fields)
+        if plots is not None and result.error is None:
+            suffix = f"_sg{j:02d}" if split else ""
+            _try_plot(plot_sample, result, sample.frames, plots / f"ep{sample.episode_index:04d}{suffix}.png")
+        results.append(result)
+    if not split:
+        return results[0], results
+    episode = EpisodeResult(sample.episode_index, sample.task_index, sample.caption, len(sample.frames), len(results), results)
+    if plots is not None:
+        _try_plot(plot_episode_overlay, episode, plots / f"ep{sample.episode_index:04d}_overlay.png", what="overlay plot")
+    return episode, results
+
+
+def run(
+    num_samples: int,
+    model_name: str,
+    out_path: str,
+    cache_dir: str | None,
+    max_frames: int,
+    num_prefixes: int,
+    plots_dir: str | None,
+    *,
+    split_subgoals: bool = False,
+) -> None:
+    """Score episodes, write JSONL records, and summarize either scoring mode."""
     out, plots, samples, vlm = _prepare(num_samples, model_name, out_path, cache_dir, max_frames, plots_dir)
-
-    results: list[SampleResult] = []
+    results = []
     with out.open("w", encoding="utf-8") as fh:
-        for i, s in enumerate(samples):
-            print(f"[run] {i + 1}/{len(samples)} ep={s.episode_index} frames={len(s.frames)} :: {s.caption[:70]!r}")
-            fields = _score_fields(vlm, s.frames, s.caption, s.fps, num_prefixes)
-            res = SampleResult(episode_index=s.episode_index, task_index=s.task_index, caption=s.caption, num_frames=len(s.frames), **fields)
-            if plots is not None and res.error is None:
-                _try_plot(plot_sample, res, s.frames, plots / f"ep{res.episode_index:04d}.png")
-            results.append(res)
-            _write_record(fh, res)
-
+        for i, sample in enumerate(samples):
+            print(f"[run] {i + 1}/{len(samples)} ep={sample.episode_index} frames={len(sample.frames)} :: {sample.caption[:70]!r}")
+            record, scores = _score_sample(vlm, sample, num_prefixes, plots, split=split_subgoals)
+            results.extend(scores)
+            _write_record(fh, record)
     _summarize(results, model_name, out)
 
 
 def run_subgoals(num_samples: int, model_name: str, out_path: str, cache_dir: str | None, max_frames: int, num_prefixes: int, plots_dir: str | None) -> None:
-    """Per-subgoal variant of `run`: split each episode caption into sub-actions
-    and score/plot each subgoal independently over the full clip.
-
-    Writes one JSONL line per episode (an `EpisodeResult` with its subgoals), and
-    for each episode emits per-subgoal plots (`epNNNN_sgMM.png`) plus one overlay
-    figure (`epNNNN_overlay.png`) with all subgoal progress curves together.
-    """
-    out, plots, samples, vlm = _prepare(num_samples, model_name, out_path, cache_dir, max_frames, plots_dir)
-
-    all_subgoals: list[SubgoalResult] = []
-    with out.open("w", encoding="utf-8") as fh:
-        for i, s in enumerate(samples):
-            subgoals = split_subgoals(s.caption)
-            print(f"[run] {i + 1}/{len(samples)} ep={s.episode_index} frames={len(s.frames)} subgoals={len(subgoals)}")
-            sg_results: list[SubgoalResult] = []
-            for j, sg in enumerate(subgoals):
-                print(f"    subgoal {j + 1}/{len(subgoals)} :: {sg[:70]!r}")
-                fields = _score_fields(vlm, s.frames, sg, s.fps, num_prefixes)
-                sr = SubgoalResult(episode_index=s.episode_index, subgoal_index=j, caption=sg, num_frames=len(s.frames), **fields)
-                if plots is not None and sr.error is None:
-                    _try_plot(plot_sample, sr, s.frames, plots / f"ep{s.episode_index:04d}_sg{j:02d}.png")
-                sg_results.append(sr)
-            all_subgoals.extend(sg_results)
-
-            ep_res = EpisodeResult(
-                episode_index=s.episode_index,
-                task_index=s.task_index,
-                full_caption=s.caption,
-                num_frames=len(s.frames),
-                num_subgoals=len(subgoals),
-                subgoals=sg_results,
-            )
-            if plots is not None:
-                _try_plot(plot_episode_overlay, ep_res, plots / f"ep{s.episode_index:04d}_overlay.png", what="overlay plot")
-            _write_record(fh, ep_res)
-
-    _summarize(all_subgoals, model_name, out)
+    """Compatibility entry point for per-subgoal scoring."""
+    run(num_samples, model_name, out_path, cache_dir, max_frames, num_prefixes, plots_dir, split_subgoals=True)
 
 
 def _summarize(results: list[SampleResult] | list[SubgoalResult], model_name: str, out: Path) -> None:
@@ -778,26 +629,31 @@ def main() -> None:
     p = argparse.ArgumentParser(description="TOPReward-style logits+progress reward on Ego4D")
     p.add_argument("--num-samples", type=int, default=40)
     p.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
-    p.add_argument("--out", default="runs/ego4d_topreward.jsonl")
-    p.add_argument("--cache-dir", default=None, help="HF datasets cache dir (defaults to HF_HOME)")
+    p.add_argument("--out", help="JSONL output (default: runs/<model>[_subgoals]/topreward.jsonl)")
+    p.add_argument("--cache-dir", default=None, help="HF datasets cache directory (default: Hugging Face cache settings)")
     p.add_argument("--max-frames", type=int, default=12, help="max frames per clip fed to the model")
     p.add_argument("--num-prefixes", type=int, default=8, help="prefix points for the progress curve")
-    p.add_argument("--plots-dir", default="runs/plots", help="dir for per-sample progress+keyframe plots ('' to disable)")
+    p.add_argument("--plots-dir", default=None, help="plot directory (default: plots beside --out; '' to disable)")
     p.add_argument(
         "--split-subgoals",
         action="store_true",
         help="split each episode caption into its sub-actions and score/plot each subgoal independently over the full clip",
     )
     args = p.parse_args()
-    runner = run_subgoals if args.split_subgoals else run
-    runner(
+    if args.num_samples < 1 or args.max_frames < 2 or args.num_prefixes < 1:
+        p.error("--num-samples and --num-prefixes must be positive; --max-frames must be at least 2")
+    tag = Path(args.model.rstrip("/")).name if Path(args.model).exists() else args.model.replace("/", "_")
+    out = Path(args.out) if args.out else Path("runs") / (tag + ("_subgoals" if args.split_subgoals else "")) / "topreward.jsonl"
+    plots = str(out.parent / "plots") if args.plots_dir is None else args.plots_dir
+    run(
         num_samples=args.num_samples,
         model_name=args.model,
-        out_path=args.out,
+        out_path=str(out),
         cache_dir=args.cache_dir,
         max_frames=args.max_frames,
         num_prefixes=args.num_prefixes,
-        plots_dir=args.plots_dir or None,
+        plots_dir=plots or None,
+        split_subgoals=args.split_subgoals,
     )
 
 

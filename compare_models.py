@@ -1,15 +1,7 @@
-"""compare_models.py — aggregate topreward_test.py runs across models.
+"""Compare whole-episode runs under runs/<tag>/topreward.jsonl.
 
-Reads each model's `runs/<TAG>/topreward.jsonl`, then writes:
-  * runs/comparison.json            — per-model VOC / reward / P(True) stats
-  * runs/comparison_voc.png         — VOC-by-model bar chart (mean +/- std)
-  * runs/comparison_curves.png      — progress curves of a few shared episodes,
-                                       overlaid across models
-  * a markdown table to stdout
-
-Episodes are loaded deterministically by topreward_test.py, so episode_index
-aligns across models and curves are directly comparable.
-"""
+Write aggregate JSON, VOC bars, and shared-episode curves; print a summary
+table. Episode indices align because the loader uses dataset order."""
 
 from __future__ import annotations
 
@@ -33,8 +25,7 @@ def main() -> None:
     args = ap.parse_args()
 
     runs = Path(args.runs_dir)
-    # Discover model run dirs (those containing topreward.jsonl).
-    model_dirs = sorted(d for d in runs.iterdir() if d.is_dir() and (d / "topreward.jsonl").exists())
+    model_dirs = sorted(path.parent for path in runs.glob("*/topreward.jsonl"))
     if not model_dirs:
         print(f"No model runs found under {runs}/*/topreward.jsonl")
         return
@@ -42,7 +33,7 @@ def main() -> None:
     by_ep: dict[str, dict[int, dict]] = {}  # tag -> episode_index -> row
     summary: dict[str, dict] = {}
     for d in model_dirs:
-        rows = [r for r in tr.read_jsonl(d / "topreward.jsonl") if r.get("error") is None]
+        rows = [r for r in tr.read_jsonl(d / "topreward.jsonl") if r.get("error") is None and "reward_mean" in r]
         if not rows:
             continue
         tag = d.name
@@ -54,12 +45,15 @@ def main() -> None:
             "answer_prob": tr.summary_stats(r["answer_token_prob"] for r in rows),
         }
 
+    if not summary:
+        print(f"No valid whole-episode scores found under {runs}")
+        return
+
     (runs / "comparison.json").write_text(json.dumps(summary, indent=2))
 
     # Models ordered by mean VOC, best first; used by the table and both figures.
     order = sorted(summary, key=lambda t: summary[t]["voc"]["mean"], reverse=True)
 
-    # --- markdown table ---
     print(f"\n{'model':<32} {'n':>4} {'VOC mean':>9} {'VOC std':>8} {'reward':>8} {'P(True)':>9}")
     print("-" * 76)
     for tag in order:
@@ -67,7 +61,6 @@ def main() -> None:
         v, r, p = s["voc"], s["reward_mean"], s["answer_prob"]
         print(f"{tag:<32} {s['num_valid']:>4} {v['mean']:>9.3f} {v['std']:>8.3f} {r['mean']:>8.2f} {p['mean']:>9.4f}")
 
-    # --- VOC bar chart ---
     plt = tr.agg_pyplot()
 
     means = [summary[t]["voc"]["mean"] for t in order]
@@ -86,8 +79,9 @@ def main() -> None:
     fig.savefig(runs / "comparison_voc.png", dpi=120)
     plt.close(fig)
 
-    # --- progress-curve overlays for a few shared episodes ---
     eps = args.curve_episodes
+    if not eps:
+        return
     ncol = min(3, len(eps))
     nrow = int(np.ceil(len(eps) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 3.6 * nrow), constrained_layout=True, squeeze=False)

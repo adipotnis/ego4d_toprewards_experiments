@@ -1,33 +1,13 @@
-"""make_subgoal_videos.py — synced per-episode video for the subgoal run.
+"""Render clips above synchronized subgoal progress curves.
 
-For each episode produced by `topreward_test.py --split-subgoals`, render an mp4:
-
-    +-------------------------------------------------------------+
-    |                  the Ego4D clip (plays smooth)              |
-    +------------+------------+------------+ ... +----------------+
-    | subgoal 0  | subgoal 1  | subgoal 2  |     |  subgoal N-1   |  <- side by side
-    | progress   | progress   | progress   |     |  progress      |     (scaled down)
-    +------------+------------+------------+ ... +----------------+
-
-The real episode frames play in the top panel. A red cursor sweeps each
-subgoal's progress curve left->right in sync with the video's time fraction,
-with a dot riding the (interpolated) curve. Each subplot is titled with its
-subgoal text + VOC.
-
-Reads the curves from the run's JSONL (one EpisodeResult per line) and re-decodes
-the full frames of exactly those episodes via `topreward_test.load_ego4d_samples`
-(CPU only, uses the cached videos in HF_HOME). Encodes mp4 with PyAV (no ffmpeg
-binary needed).
-
-    python make_subgoal_videos.py \
-        --jsonl runs/Qwen_Qwen3-VL-8B-Instruct_subgoals/topreward.jsonl \
-        --out-dir runs/Qwen_Qwen3-VL-8B-Instruct_subgoals/videos
-"""
+Read a --split-subgoals JSONL, reload its Ego4D frames, and encode MP4s
+with PyAV. Runs on CPU; pass --jsonl to select the input run."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 
@@ -41,6 +21,7 @@ def _even(n: int) -> int:
 def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_frames: int, out_fps: int, dpi: int = 100) -> bool:
     """Render one episode's synced video. Returns True on success."""
     import av
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     plt = tr.agg_pyplot()
 
@@ -49,12 +30,10 @@ def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_fram
     if n == 0 or len(frames) < 2:
         return False
 
-    # Subsample the top-panel frames for rendering (keeps encode time bounded while
-    # still smooth). These are only for display; the curves are unchanged.
+    # Limit encoding work by subsampling display frames only.
     vid = tr.uniform_subsample(frames, max_render_frames)
     total = len(vid)
 
-    # --- figure: top video spans all columns, one subplot per subgoal below ---
     fig = plt.figure(figsize=(max(12.0, n * 1.55), 7.2), dpi=dpi, constrained_layout=True)
     gs = fig.add_gridspec(2, n, height_ratios=[3.2, 2.0])
 
@@ -89,8 +68,7 @@ def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_fram
         ax.set_xlabel("frames", fontsize=6)
         cursors.append((xs, ys, vline, dot))
 
-    # Lock the layout once (constrained_layout re-solving every frame is slow and
-    # can jitter the canvas size); after the first draw the geometry is stable.
+    # Freeze layout after the first draw to avoid per-frame work and jitter.
     fig.canvas.draw()
     fig.set_layout_engine("none")
 
@@ -112,7 +90,7 @@ def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_fram
             vline.set_xdata([cx, cx])
             dot.set_data([cx], [cy])
         fig.canvas.draw()
-        buf = np.asarray(fig.canvas.buffer_rgba())[:h, :w, :3]
+        buf = np.asarray(cast(FigureCanvasAgg, fig.canvas).buffer_rgba())[:h, :w, :3]
         frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(buf), format="rgb24")
         for pkt in stream.encode(frame):
             container.mux(pkt)
@@ -126,26 +104,27 @@ def render_episode_video(ep: dict, frames: list, out_path: Path, max_render_fram
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Render synced subgoal videos for a --split-subgoals run")
-    p.add_argument("--jsonl", default="runs/Qwen_Qwen3-VL-8B-Instruct_subgoals/topreward.jsonl")
-    p.add_argument("--out-dir", default="runs/Qwen_Qwen3-VL-8B-Instruct_subgoals/videos")
-    p.add_argument("--cache-dir", default=None, help="HF cache dir (defaults to HF_HOME)")
+    p.add_argument("--jsonl", required=True, type=Path)
+    p.add_argument("--out-dir", type=Path, help="output directory (default: videos beside --jsonl)")
+    p.add_argument("--cache-dir", default=None, help="HF datasets cache directory (default: Hugging Face cache settings)")
     p.add_argument("--max-frames", type=int, default=60, help="max top-panel frames rendered per clip")
     p.add_argument("--fps", type=int, default=12, help="output video fps")
     p.add_argument("--episodes", default="", help="comma-separated episode indices to render (default: all in the jsonl)")
     args = p.parse_args()
 
-    episodes = tr.read_jsonl(Path(args.jsonl))
+    if args.max_frames < 2 or args.fps < 1:
+        p.error("--max-frames must be at least 2 and --fps must be positive")
+    episodes = tr.read_jsonl(args.jsonl)
     if args.episodes:
         want = {int(x) for x in args.episodes.split(",") if x.strip()}
         episodes = [e for e in episodes if e["episode_index"] in want]
     n_eps = len(episodes)
 
-    # Re-decode full frames for exactly the episodes we need.
     need = {e["episode_index"] for e in episodes}
     samples = tr.load_ego4d_samples(len(need), cache_dir=args.cache_dir, episode_indices=need)
     frames_by_ep = {s.episode_index: s.frames for s in samples}
 
-    out_dir = Path(args.out_dir)
+    out_dir = args.out_dir or args.jsonl.parent / "videos"
     made = []
     for i, ep in enumerate(episodes):
         epi = ep["episode_index"]
