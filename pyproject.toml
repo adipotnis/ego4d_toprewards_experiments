@@ -75,7 +75,7 @@ line_length = 160
 line-length = 160
 
 [tool.setuptools.packages.find]
-include = []
+include = ["ego4d_toprewards*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

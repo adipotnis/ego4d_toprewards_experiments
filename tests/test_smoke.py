@@ -3,15 +3,14 @@
 import json
 import subprocess
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import av
 import numpy as np
 import torch
 
-import make_subgoal_videos as videos
-import topreward_test as tr
+from ego4d_toprewards import core as tr
+from ego4d_toprewards.cli import videos
 
 
 def test_basic_run(tmp_path, monkeypatch):
@@ -55,8 +54,7 @@ def test_basic_run(tmp_path, monkeypatch):
             with av.open(str(mp4)) as container:
                 assert len(list(container.decode(video=0))) == 2
 
-    script = Path(tr.__file__).with_name("compare_models.py")
-    subprocess.run([sys.executable, str(script), "--runs-dir", str(tmp_path), "--curve-episodes", "0"], check=True)
+    subprocess.run([sys.executable, "-m", "ego4d_toprewards.cli.compare", "--runs-dir", str(tmp_path), "--curve-episodes", "0"], check=True)
     assert set(json.loads((tmp_path / "comparison.json").read_text())) == {"model"}
     assert (tmp_path / "comparison_curves.png").is_file()
     assert tr.split_subgoals(" picks cup., , pours water. ") == ["picks cup.", "pours water."]

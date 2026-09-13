@@ -15,7 +15,7 @@ Run from the repository directory:
 
 ```bash
 uv sync
-uv run python topreward_test.py --model Qwen/Qwen3-VL-2B-Instruct --num-samples 10
+uv run python -m ego4d_toprewards.cli.run --model Qwen/Qwen3-VL-2B-Instruct --num-samples 10
 ```
 
 For Molmo2, use `--model allenai/Molmo2-4B`. It loads custom model code with
@@ -35,9 +35,9 @@ Useful options:
 clip**; the dataset provides no per-action frame boundaries.
 
 ```bash
-uv run python topreward_test.py --model Qwen/Qwen3-VL-2B-Instruct --num-samples 10 --split-subgoals
-uv run python make_subgoal_videos.py --jsonl runs/Qwen_Qwen3-VL-2B-Instruct_subgoals/topreward.jsonl
-uv run python compare_models.py --runs-dir runs
+uv run python -m ego4d_toprewards.cli.run --model Qwen/Qwen3-VL-2B-Instruct --num-samples 10 --split-subgoals
+uv run python -m ego4d_toprewards.cli.videos --jsonl runs/Qwen_Qwen3-VL-2B-Instruct_subgoals/topreward.jsonl
+uv run python -m ego4d_toprewards.cli.compare --runs-dir runs
 ```
 
 Video rendering runs on CPU and writes synchronized MP4s beside the JSONL in
@@ -52,6 +52,19 @@ with `_subgoals` appended in subgoal mode:
 - `topreward.jsonl`: per-episode scores, token log probabilities, progress, and VOC.
 - `topreward.summary.json`: aggregate statistics and error counts.
 - `plots/`: progress/keyframe plots; subgoal mode adds per-action plots and episode overlays.
+
+## Layout
+
+```text
+ego4d_toprewards/
+  core.py       # dataset loading, scoring, plots, and run orchestration
+  cli/
+    run.py      # experiment command
+    compare.py  # model comparison
+    videos.py   # subgoal video rendering
+tests/          # offline smoke test
+runs/           # experiment outputs
+```
 
 ## Smoke test
 

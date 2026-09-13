@@ -11,7 +11,7 @@ from typing import cast
 
 import numpy as np
 
-import topreward_test as tr
+from ego4d_toprewards import core as tr
 
 
 def _even(n: int) -> int:

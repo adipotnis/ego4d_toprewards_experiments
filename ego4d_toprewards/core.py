@@ -1,11 +1,10 @@
 """TOPReward-style logit rewards and progress curves for Ego4D.
 
 Supports Qwen-VL and Molmo2; heavy dependencies are imported lazily.
-Run with --help for options."""
+Command-line entry points live in ego4d_toprewards.cli."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import textwrap
 from collections.abc import Callable, Iterable, Iterator
@@ -623,39 +622,3 @@ def _summarize(results: list[SampleResult] | list[SubgoalResult], model_name: st
     print("\n===== SUMMARY =====")
     print(json.dumps(summary, indent=2))
     print(f"\n[done] per-sample -> {out}\n[done] summary    -> {sp}")
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="TOPReward-style logits+progress reward on Ego4D")
-    p.add_argument("--num-samples", type=int, default=40)
-    p.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
-    p.add_argument("--out", help="JSONL output (default: runs/<model>[_subgoals]/topreward.jsonl)")
-    p.add_argument("--cache-dir", default=None, help="HF datasets cache directory (default: Hugging Face cache settings)")
-    p.add_argument("--max-frames", type=int, default=12, help="max frames per clip fed to the model")
-    p.add_argument("--num-prefixes", type=int, default=8, help="prefix points for the progress curve")
-    p.add_argument("--plots-dir", default=None, help="plot directory (default: plots beside --out; '' to disable)")
-    p.add_argument(
-        "--split-subgoals",
-        action="store_true",
-        help="split each episode caption into its sub-actions and score/plot each subgoal independently over the full clip",
-    )
-    args = p.parse_args()
-    if args.num_samples < 1 or args.max_frames < 2 or args.num_prefixes < 1:
-        p.error("--num-samples and --num-prefixes must be positive; --max-frames must be at least 2")
-    tag = Path(args.model.rstrip("/")).name if Path(args.model).exists() else args.model.replace("/", "_")
-    out = Path(args.out) if args.out else Path("runs") / (tag + ("_subgoals" if args.split_subgoals else "")) / "topreward.jsonl"
-    plots = str(out.parent / "plots") if args.plots_dir is None else args.plots_dir
-    run(
-        num_samples=args.num_samples,
-        model_name=args.model,
-        out_path=str(out),
-        cache_dir=args.cache_dir,
-        max_frames=args.max_frames,
-        num_prefixes=args.num_prefixes,
-        plots_dir=plots or None,
-        split_subgoals=args.split_subgoals,
-    )
-
-
-if __name__ == "__main__":
-    main()

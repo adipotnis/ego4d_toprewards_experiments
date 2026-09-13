@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-import topreward_test as tr
+from ego4d_toprewards import core as tr
 
 
 def _short_tag(tag: str) -> str:
